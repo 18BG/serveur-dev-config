@@ -1,0 +1,24 @@
+[Unit]
+Description=Remote AI Control agent
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting: without this, a burst of fast crashes trips
+# systemd's default start-rate limit and the agent stays DOWN until a manual
+# 'systemctl reset-failed'. We'd rather it keep trying forever.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/root/.local/bin/rac --url wss://ro.relais.dev/agent 
+Environment=HOME=/root
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=SSL_CERT_DIR=/etc/ssl/certs
+# Restart on ANY exit — crashes AND the clean exit(0) the agent does after a
+# self-update (so the wrapper relaunches it on the new binary).
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

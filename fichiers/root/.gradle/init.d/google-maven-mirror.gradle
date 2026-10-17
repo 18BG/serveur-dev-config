@@ -1,0 +1,19 @@
+// dl.google.com bloque les gros téléchargements (et les HEAD/404 en HTTP/1.1) depuis
+// ce serveur : le dépôt Maven de Google (google()) passe par le proxy local
+// google-maven-proxy (systemctl status google-maven-proxy, code dans /opt/google-maven-proxy).
+def googleMirror = { repo ->
+    if (repo instanceof MavenArtifactRepository && repo.url.host in ['dl.google.com', 'maven.google.com']) {
+        repo.url = 'http://127.0.0.1:8765/android/maven2/'
+        repo.allowInsecureProtocol = true
+    }
+}
+
+beforeSettings { settings ->
+    settings.pluginManagement.repositories.configureEach(googleMirror)
+    settings.dependencyResolutionManagement.repositories.configureEach(googleMirror)
+}
+
+allprojects {
+    buildscript.repositories.configureEach(googleMirror)
+    repositories.configureEach(googleMirror)
+}

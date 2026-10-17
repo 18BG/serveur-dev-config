@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# android-emu — réservation exclusive de l'émulateur Android partagé (Redroid).
+#
+# Un seul émulateur pour toutes les sessions d'agents. Une session le réserve
+# (start) et obtient un Android tout neuf ; à la fin (stop), ses apps sont
+# désinstallées et l'émulateur est détruit. Une réservation expire au bout de
+# 30 min sans renew, ou dès que la session propriétaire se ferme : le minuteur
+# android-emu-reaper.timer fait alors le ménage.
+#
+# Règles pour les agents : ~/.claude/rules/emulateur-android.md
+
+set -euo pipefail
+
+IMAGE=redroid/redroid:14.0.0_64only-latest
+CONTAINER=redroid
+# Hors de la plage 5555-5585 que adb scanne d'office : sinon l'appareil apparaît
+# en double (127.0.0.1:5555 et emulator-5554).
+PORT=5600
+SERIAL=127.0.0.1:$PORT
+ADB=/root/Android/Sdk/platform-tools/adb
+STATE_DIR=/run/android-emu   # tmpfs : les réservations ne survivent pas au redémarrage
+LEASE=$STATE_DIR/lease
+LOG=/var/log/android-emu.log
+DEFAULT_LEASE_MIN=30
+MAX_LEASE_MIN=180
+BOOT_TIMEOUT=240
+EXIT_BUSY=75
+
+usage() {
+  cat <<'EOF'
+Usage : android-emu <commande>
+
+  start --task "ce que tu testes" [--wait MIN] [--lease MIN]
+          Réserve l'émulateur pour ta session et démarre un Android propre.
+          S'il est occupé : attend jusqu'à MIN minutes (défaut 0), puis sort
+          avec le code 75.
+  renew [--lease MIN]   Prolonge ta réservation (défaut 30 min, max 180).
+  stop                  Désinstalle les apps, détruit l'émulateur, libère la réservation.
+                        (--force : réservé à l'utilisateur, arrête la réservation d'une autre session)
+  status                Qui utilise l'émulateur, pour quoi, jusqu'à quand.
+  doctor                Vérifie que tout est prêt (module noyau, Docker, image…).
+  reap                  Ménage automatique (lancé par android-emu-reaper.timer).
+
+Appareil : 127.0.0.1:5600 — historique : /var/log/android-emu.log
+EOF
+}
+
+die() { echo "android-emu : $*" >&2; exit 1; }
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+now() { date +%s; }
+hhmm() { date -d "@$1" +%H:%M; }
+
+# --- Identité de la session ---------------------------------------------------
+
+stat_field() {  # stat_field PID N : champ N de /proc/PID/stat (N >= 3)
+  local s
+  s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  s=${s##*) }   # retire « pid (comm) » : comm peut contenir des espaces
+  awk -v n=$(( $2 - 2 )) '{print $n}' <<<"$s"
+}
+
+session_pid() {
+  # Session Claude Code : son processus claude. Sinon, le premier ancêtre qui
+  # n'est pas un shell (sshd pour un humain, autre agent…).
+  if [[ -n ${CLAUDE_PID:-} && -d /proc/$CLAUDE_PID ]]; then
+    echo "$CLAUDE_PID"
+    return
+  fi
+  local p=$PPID
+  while (( p > 1 )); do
+    case $(cat "/proc/$p/comm" 2>/dev/null) in
+      bash|sh|dash|zsh|fish|ksh|timeout|env|flock|sudo|su|nohup|setsid|script|xargs)
+        p=$(stat_field "$p" 4) || p=1 ;;
+      *) echo "$p"; return ;;
+    esac
+  done
+  echo "$PPID"
+}
+
+owner_alive() {  # owner_alive "PID:DÉMARRAGE" (le démarrage évite les PID réutilisés)
+  local pid=${1%%:*} start=${1#*:}
+  [[ -n $pid && $(stat_field "$pid" 22 2>/dev/null) == "$start" ]]
+}
+
+# --- Réservation ----------------------------------------------------------------
+
+lease_get() { sed -n "s/^$1=//p" "$LEASE" 2>/dev/null | head -n1; }
+
+lease_set() {  # lease_set clé valeur [clé valeur…], réécriture atomique
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.lease.XXXXXX")
+  [[ -f $LEASE ]] && cp "$LEASE" "$tmp"
+  while (( $# >= 2 )); do
+    sed -i "/^$1=/d" "$tmp"
+    printf '%s=%s\n' "$1" "${2//$'\n'/ }" >> "$tmp"
+    shift 2
+  done
+  mv "$tmp" "$LEASE"
+}
+
+lease_state() {  # free | mine | busy | stale
+  [[ -f $LEASE ]] || { echo free; return; }
+  local expires
+  expires=$(lease_get expires)
+  if ! owner_alive "$(lease_get owner)" || (( $(now) >= ${expires:-0} )); then
+    echo stale
+  elif [[ $(lease_get owner) == "$ME" ]]; then
+    echo mine
+  else
+    echo busy
+  fi
+}
+
+lock() {
+  exec 9>"$STATE_DIR/mutex"
+  flock -w 60 9 || die "verrou interne bloqué depuis 60 s"
+}
+unlock() { flock -u 9; }
+
+# --- Émulateur ------------------------------------------------------------------
+
+container_exists() { docker container inspect "$CONTAINER" >/dev/null 2>&1; }
+container_running() { [[ $(docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null) == true ]]; }
+adb_server_up() { ss -ltn 2>/dev/null | grep -q '127.0.0.1:5037 '; }
+device_ready() { [[ $("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') == 1 ]]; }
+
+adb_connect() {
+  if [[ $("$ADB" -s "$SERIAL" get-state 2>/dev/null) != device ]]; then
+    "$ADB" disconnect "$SERIAL" >/dev/null 2>&1 || true
+    "$ADB" connect "$SERIAL" >/dev/null 2>&1 || true
+  fi
+}
+
+create_emulator() {
+  docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
+  modprobe binder_linux 2>/dev/null || true
+  docker run -d --name "$CONTAINER" --privileged -v /data -p "127.0.0.1:$PORT:5555" "$IMAGE" \
+    androidboot.redroid_gpu_mode=guest \
+    androidboot.redroid_width=720 androidboot.redroid_height=1280 androidboot.redroid_dpi=320 \
+    >/dev/null || return 1
+  local deadline=$(( $(now) + BOOT_TIMEOUT ))
+  while (( $(now) < deadline )); do
+    adb_connect
+    device_ready && return 0
+    sleep 3
+  done
+  return 1
+}
+
+destroy_emulator() {  # destroy_emulator RAISON owner|reap ; affiche les apps désinstallées
+  local baseline removed=() pkg
+  baseline=",$(lease_get baseline),"
+  # Le minuteur ne démarre pas de serveur adb juste pour désinstaller :
+  # tout est de toute façon supprimé avec le conteneur.
+  if container_running && { [[ $2 == owner ]] || adb_server_up; }; then
+    adb_connect
+    for pkg in $("$ADB" -s "$SERIAL" shell pm list packages -3 2>/dev/null | tr -d '\r' | sed 's/^package://'); do
+      [[ $baseline == *",$pkg,"* ]] && continue
+      "$ADB" -s "$SERIAL" uninstall "$pkg" >/dev/null 2>&1 && removed+=("$pkg")
+    done
+    "$ADB" -s "$SERIAL" reverse --remove-all >/dev/null 2>&1 || true
+    "$ADB" -s "$SERIAL" forward --remove-all >/dev/null 2>&1 || true
+  fi
+  if adb_server_up; then
+    "$ADB" disconnect "$SERIAL" >/dev/null 2>&1 || true
+  fi
+  docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
+  rm -f "$LEASE"
+  log "libéré ($1) ; apps désinstallées : ${removed[*]:-aucune}"
+  echo "${removed[*]:-aucune}"
+}
+
+print_ready() {
+  cat <<EOF
+Émulateur réservé pour ta session jusqu'à $(hhmm "$(lease_get expires)") (android-emu renew pour prolonger).
+Appareil : $SERIAL (Android 14, x86_64), par exemple :
+  adb -s $SERIAL install app.apk
+  flutter run -d $SERIAL
+Dès que tes tests sont finis : android-emu stop
+EOF
+}
+
+print_busy() {
+  cat <<EOF
+Émulateur occupé par une autre session depuis $(hhmm "$(lease_get since)") (réservé au plus tard jusqu'à $(hhmm "$(lease_get expires)")).
+Tâche en cours : $(lease_get task)
+Dossier : $(lease_get cwd)
+EOF
+}
+
+# --- Commandes --------------------------------------------------------------------
+
+cmd_start() {
+  local task="" wait_min=0 lease_min=$DEFAULT_LEASE_MIN
+  while (( $# )); do
+    case $1 in
+      --task) task=${2:-}; shift 2 ;;
+      --wait) wait_min=${2:-}; shift 2 ;;
+      --lease) lease_min=${2:-}; shift 2 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+  done
+  [[ -n $task ]] || die 'précise ce que tu vas tester : --task "…"'
+  [[ $wait_min =~ ^[0-9]+$ && $lease_min =~ ^[0-9]+$ ]] || die "--wait et --lease attendent un nombre de minutes"
+  (( lease_min >= 1 && lease_min <= MAX_LEASE_MIN )) || die "--lease : entre 1 et $MAX_LEASE_MIN minutes"
+
+  local give_up=$(( $(now) + wait_min * 60 )) announced=0 state logs
+  while :; do
+    lock
+    state=$(lease_state)
+    if [[ $state == stale ]]; then
+      destroy_emulator "réservation abandonnée (expirée ou session fermée) : $(lease_get task)" reap >/dev/null
+      state=free
+    fi
+    case $state in
+      mine)
+        lease_set expires $(( $(now) + lease_min * 60 ))
+        unlock
+        if ! container_running || ! { adb_connect; device_ready; }; then
+          echo "Ton émulateur ne répondait plus : redémarrage d'un Android propre…"
+          create_emulator || { destroy_emulator "échec du redémarrage" owner >/dev/null; die "Android n'a pas redémarré"; }
+        fi
+        print_ready
+        return 0 ;;
+      free)
+        lease_set owner "$ME" session "${CLAUDE_CODE_SESSION_ID:-$(cat "/proc/${ME%%:*}/comm" 2>/dev/null)}" \
+          task "$task" cwd "$PWD" since "$(now)" expires $(( $(now) + lease_min * 60 ))
+        unlock
+        log "réservé par la session ${CLAUDE_CODE_SESSION_ID:-$ME} : $task ($PWD)"
+        echo "Démarrage d'un Android propre (≈30 s)…"
+        if ! create_emulator; then
+          logs=$(docker logs --tail 20 "$CONTAINER" 2>&1 || true)
+          destroy_emulator "échec du démarrage" owner >/dev/null
+          die "Android n'a pas démarré en ${BOOT_TIMEOUT} s. Derniers logs du conteneur :
+$logs"
+        fi
+        lease_set baseline "$("$ADB" -s "$SERIAL" shell pm list packages -3 2>/dev/null | tr -d '\r' | sed 's/^package://' | paste -sd, -)"
+        print_ready
+        return 0 ;;
+      busy)
+        unlock
+        if (( $(now) >= give_up )); then
+          print_busy
+          echo "→ Attends (android-emu start --task \"…\" --wait 8) ou termine ta tâche sans test Android et liste les tests à faire."
+          exit $EXIT_BUSY
+        fi
+        if (( ! announced )); then
+          print_busy
+          echo "J'attends qu'il se libère (au plus tard jusqu'à $(hhmm "$give_up"))…"
+          announced=1
+        fi
+        sleep 10 ;;
+    esac
+  done
+}
+
+cmd_stop() {
+  local force=0 removed
+  [[ ${1:-} == --force ]] && force=1
+  lock
+  case $(lease_state) in
+    free)
+      if container_exists; then
+        removed=$(destroy_emulator "émulateur sans réservation" owner)
+        echo "Émulateur orphelin supprimé. Apps désinstallées : $removed"
+      else
+        echo "Aucune réservation en cours : rien à faire."
+      fi ;;
+    busy)
+      if (( ! force )); then
+        print_busy >&2
+        die "réservé par une autre session : tu ne peux pas l'arrêter."
+      fi
+      removed=$(destroy_emulator "arrêt forcé (--force) : $(lease_get task)" owner)
+      echo "Émulateur arrêté de force. Apps désinstallées : $removed" ;;
+    *)  # mine ou stale
+      removed=$(destroy_emulator "terminé : $(lease_get task)" owner)
+      echo "Émulateur arrêté et supprimé. Apps désinstallées : $removed" ;;
+  esac
+}
+
+cmd_renew() {
+  local lease_min=$DEFAULT_LEASE_MIN
+  [[ ${1:-} == --lease ]] && lease_min=${2:-}
+  [[ $lease_min =~ ^[0-9]+$ ]] && (( lease_min >= 1 && lease_min <= MAX_LEASE_MIN )) \
+    || die "--lease : entre 1 et $MAX_LEASE_MIN minutes"
+  lock
+  [[ $(lease_state) == mine ]] || die "ta session n'a pas de réservation active (android-emu start)."
+  lease_set expires $(( $(now) + lease_min * 60 ))
+  echo "Réservation prolongée jusqu'à $(hhmm "$(lease_get expires)")."
+}
+
+cmd_status() {
+  case $(lease_state) in
+    free) echo "Libre : aucune session n'utilise l'émulateur." ;;
+    mine) echo "Réservé par TA session jusqu'à $(hhmm "$(lease_get expires)"). Tâche : $(lease_get task)" ;;
+    busy) print_busy ;;
+    stale) echo "Réservation abandonnée (expirée ou session fermée), nettoyée sous 2 min. Tâche : $(lease_get task)" ;;
+  esac
+  if container_running; then
+    echo "Conteneur : en marche ($(docker stats --no-stream --format '{{.MemUsage}}' "$CONTAINER" | cut -d/ -f1 | xargs) de RAM), appareil $SERIAL"
+  else
+    echo "Conteneur : arrêté, aucune ressource utilisée."
+  fi
+}
+
+cmd_reap() {
+  lock
+  case $(lease_state) in
+    stale) destroy_emulator "nettoyage auto, réservation abandonnée : $(lease_get task)" reap >/dev/null ;;
+    free)
+      if container_exists; then
+        docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
+        log "nettoyage auto : conteneur sans réservation supprimé"
+      fi ;;
+  esac
+}
+
+cmd_doctor() {
+  local ko=0
+  check() {
+    if eval "$2" >/dev/null 2>&1; then echo "OK  $1"; else echo "KO  $1${3:+  →  $3}"; ko=1; fi
+  }
+  echo "Noyau : $(uname -r)"
+  check "module binder chargé" "grep -qw binder_linux /proc/modules" \
+    "apt install linux-modules-extra-\$(uname -r) && modprobe binder_linux"
+  check "binderfs disponible" "grep -qw binder /proc/filesystems"
+  check "modules pare-feu (réseau d'Android)" "grep -qw iptable_filter /proc/modules" \
+    "systemctl restart systemd-modules-load"
+  check "Docker actif" "systemctl is-active --quiet docker"
+  check "image Android présente" "docker image inspect $IMAGE" "docker pull $IMAGE"
+  check "adb présent" "test -x $ADB"
+  check "outils de dev dans le PATH de cette session (Node de nvm, flutter, adb)" \
+    "command -v flutter && command -v adb && command -v node | grep -q /.nvm/" \
+    "ouvre une nouvelle session : CLAUDE_ENV_FILE (~/.claude/settings.json) charge ~/.dev-env.sh"
+  check "nettoyage automatique actif" "systemctl is-active --quiet android-emu-reaper.timer" \
+    "systemctl enable --now android-emu-reaper.timer"
+  check "proxy Maven Google actif (builds Android)" "systemctl is-active --quiet google-maven-proxy" \
+    "systemctl restart google-maven-proxy"
+  return $ko
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    -h|--help|help) usage; return ;;
+  esac
+  (( EUID == 0 )) || die "à lancer en root"
+  mkdir -p "$STATE_DIR"
+  local sp
+  sp=$(session_pid)
+  ME="$sp:$(stat_field "$sp" 22 || true)"
+  case $cmd in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    renew) cmd_renew "$@" ;;
+    status) cmd_status ;;
+    reap) cmd_reap ;;
+    doctor) cmd_doctor ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

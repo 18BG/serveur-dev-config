@@ -1,0 +1,5 @@
+{
+  "env": {
+    "CLAUDE_ENV_FILE": "/root/.dev-env.sh"
+  }
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=Vérifie toutes les 2 minutes la réservation de l'émulateur Android
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

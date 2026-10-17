@@ -1,0 +1,7 @@
+[Unit]
+Description=Détruit l'émulateur Android partagé si sa réservation est abandonnée
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/android-emu reap
