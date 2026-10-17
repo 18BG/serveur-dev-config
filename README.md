@@ -109,6 +109,7 @@ L'appareil répond sur `127.0.0.1:5600`. Une réservation dure 30 minutes, et le
 
 - Copier `fichiers/root/.claude/settings.json` vers `~/.claude/settings.json`. Il déclare `CLAUDE_ENV_FILE=/root/.dev-env.sh`.
 - Copier `fichiers/root/.claude/rules/*.md` vers `~/.claude/rules/` : règles « sessions en parallèle » et « émulateur Android ».
+- Copier `fichiers/root/.claude/projects/` vers `~/.claude/projects/` : notes de mémoire de Claude sur les projets (état de la fonctionnalité d’activité, incident).
 - Réinstaller l'agent relais (`rac`) en suivant la procédure de relais.dev. Copier ensuite `fichiers/etc/systemd/system/rac-agent.service`, puis lancer `systemctl enable --now rac-agent`.
 - Se reconnecter à Claude Code : la connexion de l'ancien serveur doit être considérée comme compromise.
 

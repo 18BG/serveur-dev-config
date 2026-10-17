@@ -1,0 +1,3 @@
+- [Git pull GitHub indisponible](git-pull-github-indisponible.md) — pas de clé GitHub ici (serveur piraté) : pousser depuis l’ordinateur de l’utilisateur
+- [Activité utilisateurs](activite-utilisateurs-en-attente.md) — prototype « plus actifs » sur feat/activite-utilisateurs (front + backend), seuils à calibrer
+- [Serveur piraté oct. 2026](serveur-pirate-octobre-2026.md) — VPS compromis via mot de passe root faible, nettoyé, SSH par clé uniquement, réinstallation conseillée
