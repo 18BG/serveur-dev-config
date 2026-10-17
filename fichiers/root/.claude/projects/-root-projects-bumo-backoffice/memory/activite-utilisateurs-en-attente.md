@@ -7,7 +7,7 @@ metadata:
 
 The user could not settle what "active" means. On 2026-10-17 they asked for a concrete prototype "pour voir" instead of more explanation, so keep explanations short and show results.
 
-Prototype, uncommitted at the time, on branch `feat/activite-utilisateurs` in both repos:
+Prototype pushed to GitHub on 2026-10-17, branch `feat/activite-utilisateurs` in both repos (front commit 29a8d6d "wip" by the user, backend 6ae1804). No PR yet: the user tests first; front PR goes to feat/bumo-admin-refonte-ui after fix/navigation-et-devises is merged, backend PR to add-backoffice-routes:
 - bumo-hooks: `backoffice_activity_service.py`, routes `GET /bumo/backoffice/activity?business=|user=&grain=day|week|month` and `/activity/top?days=7|30|90`.
 - front: the "Activité dans l'app" panel on business and user pages, plus the `/activity` page "Les plus actifs".
 

@@ -8,4 +8,4 @@ metadata:
   modified: 2026-10-17T18:02:01.446Z
 ---
 
-The remote is `git@github.com:ssakone/bumo_backoffice.git`. From this server, `git pull` fails with "Host key verification failed" (no GitHub SSH key in ~/.ssh). The user sometimes pulls on their own: check `git log origin/<branch>` and `git reflog` before saying a commit is missing.
+The remote is `git@github.com:ssakone/bumo_backoffice.git`. The server was compromised in Oct 2026 (see [[serveur-pirate-octobre-2026]]); its GitHub key was revoked. A temporary key `bumo-vps-temporaire` was used once on 2026-10-17 to push, then deleted. Server setup lives in the private repo 18BG/serveur-dev-config. The user sometimes pulls on their own: check `git log origin/<branch>` and `git reflog` before saying a commit is missing.
