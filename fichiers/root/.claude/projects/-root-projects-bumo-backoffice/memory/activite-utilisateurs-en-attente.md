@@ -14,4 +14,4 @@ Prototype pushed to GitHub on 2026-10-17, branch `feat/activite-utilisateurs` in
 Definition chosen: an operation is a deliberate action with an author (sale, purchase, expense, quotation, entered order, product, customer, cash session opened). The level counts days with at least one operation among the last 28 calendar days: regular ≥ 12, occasional 1–11, asleep 0 with history, never, new < 14 days.
 
 **Why:** the user wanted something "vrai et parlant", not just a chart.
-**How to apply:** the thresholds (12/28, 14 days) are guesses; calibrate them on production data before relying on them. Front branch is stacked on fix/navigation-et-devises. See [[git-pull-github-indisponible]].
+**How to apply:** the thresholds (12/28, 14 days) are guesses; calibrate them on production data before relying on them. Front branch is stacked on fix/navigation-et-devises. See [[acces-github]].

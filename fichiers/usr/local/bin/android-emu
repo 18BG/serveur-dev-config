@@ -335,8 +335,11 @@ cmd_doctor() {
     "ouvre une nouvelle session : CLAUDE_ENV_FILE (~/.claude/settings.json) charge ~/.dev-env.sh"
   check "nettoyage automatique actif" "systemctl is-active --quiet android-emu-reaper.timer" \
     "systemctl enable --now android-emu-reaper.timer"
-  check "proxy Maven Google actif (builds Android)" "systemctl is-active --quiet google-maven-proxy" \
-    "systemctl restart google-maven-proxy"
+  # Le proxy n'est installé que si dl.google.com bloque les téléchargements (README, §3).
+  if [[ -f /etc/systemd/system/google-maven-proxy.service ]]; then
+    check "proxy Maven Google actif (builds Android)" "systemctl is-active --quiet google-maven-proxy" \
+      "systemctl restart google-maven-proxy"
+  fi
   return $ko
 }
 
